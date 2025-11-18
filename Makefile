@@ -10,7 +10,9 @@ ROM_AFILES = $(addprefix $(MSX_DIR)/src/,portio.s timeout.s)
 # ROM_CFILES = $(addprefix $(MSX_DIR)/,disk.c)
 # ROM_AFILES = $(addprefix $(MSX_DIR)/,header.s jptable.s io.s)
 
-$(BUILD_DIR)/$(FIRMWARE): main.c bus.pio rom.h $(BUILD_MAKE)
+SRC = main.cpp FujiBusPacket.cpp FujiBusPacket.h bus.pio rom.h fujiDeviceID.h fujiCommandID.h
+
+$(BUILD_DIR)/$(FIRMWARE): $(SRC) $(BUILD_MAKE)
 	defoogi make -C $(BUILD_DIR)
 
 $(BUILD_MAKE): CMakeLists.txt
