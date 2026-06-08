@@ -42,6 +42,10 @@
 #define ROM_MAX_SEGS 8
 #define RAMROM_ACTIVATE_ADDR 0x4000
 
+#ifdef BOARD_coco_proto_260402
+#define ROM_BANK_REG 0xFF40   // FlashPak/RoboCop bank register: a write here selects the 16K page at $C000
+#endif // BOARD_coco_proto_260402
+
 #define USE_IRQ 0
 
 #define PSM_WAITSEL 0
@@ -227,6 +231,16 @@ void __time_critical_func(romulan)(void)
     if (!ramrom_ptr && rom_ptr != ROM)
       rom_ptr = ROM;
 
+#ifdef BOARD_coco_proto_260402
+    // FlashPak/RoboCop-style bank select: while a user ROM is active, a write to
+    // $FF40 latches which 16K page appears at $C000. When the built-in ROM is
+    // active $FF40 is the disk controller's DSKREG, so only bank when ramrom_active.
+    if (ramrom_active && bus.addr == ROM_BANK_REG && !bus.rw) {
+      ramrom_bank = bus.data & (ROM_MAX_SEGS - 1);
+      rom_ptr = &ramrom[ramrom_bank * ROM_SEG_SIZE];
+    }
+    else
+#endif // BOARD_coco_proto_260402
     // FIXME - only check IO_BASE if rom_ptr == ROM
     if (IO_BASE <= bus.addr && bus.addr < IO_TOP) {
       unsigned io_reg = (bus.addr - IO_BASE) & 0x3;
