@@ -236,8 +236,10 @@ void __time_critical_func(romulan)(void)
     // $FF40 latches which 16K page appears at $C000. When the built-in ROM is
     // active $FF40 is the disk controller's DSKREG, so only bank when ramrom_active.
     if (ramrom_active && bus.addr == ROM_BANK_REG && !bus.rw) {
-      ramrom_bank = bus.data & (ROM_MAX_SEGS - 1);
-      rom_ptr = &ramrom[ramrom_bank * ROM_SEG_SIZE];
+      // Match MAME coco_pak_banked: bank = the written byte, ROM offset =
+      // (bank * 16K) % buffer size (= the 128K region size, like m_eprom->bytes()).
+      ramrom_bank = bus.data;
+      rom_ptr = &ramrom[(ramrom_bank * ROM_SEG_SIZE) % sizeof(ramrom)];
     }
     else
 #endif // BOARD_coco_proto_260402
