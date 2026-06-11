@@ -44,6 +44,13 @@
 
 #ifdef BOARD_coco_proto_260402
 #define ROM_BANK_REG 0xFF40   // FlashPak/RoboCop bank register: a write here selects the 16K page at $C000
+// Glitch filter: the GIME transiently asserts CTS/SCS during address
+// transitions (observed as one-bit-off $FFxx phantom events). A real read
+// still holds its select low when we process it; a glitch is long gone.
+// Re-sample before serving so we never drive the bus on a phantom cycle.
+#define SEL_LIVE(pin) (!gpio_get(pin))
+#else
+#define SEL_LIVE(pin) (1)
 #endif // BOARD_coco_proto_260402
 
 #define USE_IRQ 0
@@ -253,13 +260,15 @@ void __time_critical_func(romulan)(void)
 
       switch (io_reg) {
       case IO_GETC: // Read byte
-        pio_put_fifo(PSM_READ, sio_hw->fifo_rd);
+        if (SEL_LIVE(SCS_PIN))   // also avoids popping the FIFO on a phantom
+          pio_put_fifo(PSM_READ, sio_hw->fifo_rd);
         break;
       case IO_STATUS: // Read status reg
-        pio_put_fifo(PSM_READ,
-          (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS ? IO_FLAG_AVAIL : 0x00)
-          | (ramrom_ready ? IO_FLAG_USERROM_READY : 0x00)
-        );
+        if (SEL_LIVE(SCS_PIN))
+          pio_put_fifo(PSM_READ,
+            (sio_hw->fifo_st & SIO_FIFO_ST_VLD_BITS ? IO_FLAG_AVAIL : 0x00)
+            | (ramrom_ready ? IO_FLAG_USERROM_READY : 0x00)
+          );
         break;
       case IO_PUTC: // Write byte
         sio_hw->fifo_wr = bus.combined;
@@ -268,8 +277,11 @@ void __time_critical_func(romulan)(void)
       case IO_CONTROL: // Write control reg
         // Command to enable/disable user ROM, or enable/disable ROM autostart
       	if (bus.data & IO_FLAG_ROM_MODE_CMD) {
-          // Enable/disable user ROM
-          if (bus.data & IO_FLAG_USERROM_ENABLE) {
+          // Enable/disable user ROM. Refuse if no image was actually
+          // transferred (e.g. stale mount after a power cycle wiped ramrom) -
+          // otherwise the !ramrom_ptr fallback silently serves the built-in
+          // HDB-DOS, which crashes off the end of its 8K with no disk hardware.
+          if ((bus.data & IO_FLAG_USERROM_ENABLE) && ramrom_ready) {
             ramrom_active = true;
             rom_ptr = &ramrom[ramrom_bank * ROM_SEG_SIZE];
             if (bus.data & IO_FLAG_AUTOSTART_ENABLE) {
@@ -303,9 +315,19 @@ void __time_critical_func(romulan)(void)
       rom_offset = bus.addr - BUS_ROM_BASE;
       //rom_offset &= POW2_CEIL(sizeof(ROM)) - 1;
       bus.data = rom_ptr[rom_offset];
-      pio_put_fifo(PSM_READ, rom_ptr[rom_offset]);
+      if (SEL_LIVE(CTS_PIN))
+        pio_put_fifo(PSM_READ, rom_ptr[rom_offset]);
       //DEBUG_PRINTF("PEEK ADDR:%04x DATA:%02x\r\n", bus.addr, bus.data);
     }
+#ifdef BOARD_coco_proto_260402
+    // 32K cart low half at $8000-$BFFF (GIME mode 3). Dump is [$C000 half][$8000
+    // half], so the $8000 half is the second 16K segment of the loaded image.
+    else if (ramrom_active && 0x8000 <= bus.addr && bus.addr < BUS_ROM_BASE) {
+      rom_offset = ROM_SEG_SIZE + (bus.addr - 0x8000);
+      if (SEL_LIVE(CTS_PIN))
+        pio_put_fifo(PSM_READ, ramrom[rom_offset]);
+    }
+#endif // BOARD_coco_proto_260402
 
     last_addr = bus.addr;
   }
