@@ -24,6 +24,8 @@
 #include <hardware/irq.h>
 #include <hardware/watchdog.h>
 #include <hardware/clocks.h>
+#include <hardware/vreg.h>
+#include <hardware/sync.h>
 #include <tusb.h>
 
 #include <string>
@@ -50,6 +52,15 @@
 #endif // PICO_RP2040
 #define SIZE_8K   0x2000
 #define SIZE_16K  0x4000
+#define SIZE_32K  0x8000
+
+// CoCo maps image $0000-$3FFF to $C000-$FFFF and $4000-$7FFF to $8000-$BFFF,
+// i.e. the index is the address with A14 inverted. Others map from BUS_ROM_BASE.
+#if defined(BOARD_coco_proto_260402) || defined(BOARD_picorom_coco)
+#define COCO_CART_WINDOW 1
+#else
+#define COCO_CART_WINDOW 0
+#endif
 
 #define USE_IRQ 0
 
@@ -92,6 +103,27 @@ volatile uint16_t user_rom_bank_count = 1;
 volatile uint8_t user_rom_selected_bank = 0;
 volatile bool user_rom_closed = false;
 volatile bool user_rom_active = false;
+volatile uint16_t rom_addr_mask = SIZE_16K - 1;
+
+// Diagnostic readout on GP37, 9600 8N1 bit-banged from core 0 only. Transmit
+// blocks, so it must not run while DriveWire is active.
+#define DIAG_PIN 37
+#define DIAG_BIT_US 104
+#define DIAG_RING 1
+volatile uint8_t diag_blink_count = 0;
+volatile uint32_t user_rom_len = 0;
+volatile uint32_t diag_lo_reads = 0;
+volatile uint32_t diag_hi_reads = 0;
+// Stops core 1 recording mid-dump, so the ring is a sequence and not samples.
+volatile bool diag_frozen = false;
+volatile uint16_t diag_resets = 0;
+volatile uint16_t diag_ioctl = 0;
+// addr | rw<<16 | data<<24
+#define BF_CAP 128
+volatile uint32_t diag_bf[BF_CAP];
+volatile uint32_t diag_bf_idx = 0;
+// Rounded up to a power of two so short carts mirror, as real hardware does.
+volatile uint16_t user_rom_mask = SIZE_16K - 1;
 
 #ifdef BOARD_coco_proto_260402
 // Power-on-like Program Pak boot: on user-ROM enable we point rom_ptr at the
@@ -210,11 +242,16 @@ void setup_pio_irq_logic()
   return;
 }
 
+// Bookkeeping only - never call this before the bus has been answered.
+
 void __time_critical_func(romulan)(void)
 {
   BusSignals bus;
   uint32_t rom_offset, rom_size = POW2_CEIL(sizeof(ROM));
   uint8_t *rom_ptr = ROM;
+  // Register-resident mirrors so the fast path never reloads the volatiles.
+  bool l_active = false;
+  uint16_t l_mask = SIZE_16K - 1;
   uint32_t last_bus_state = -1;
   uint8_t bank = 0;
   bool switch_bank = false;
@@ -236,6 +273,29 @@ void __time_critical_func(romulan)(void)
     DEBUG_PRINTF("ADDR:%04x DATA:%02x CTS:%d SCS:%d RW:%d UN:%d COMBINED:0x%08x\r\n",
                  bus.addr, bus.data, 0, bus.scs, bus.rw, bus.unused, bus.combined);
 #endif
+
+#if COCO_CART_WINDOW
+    // Answer first, record after. Reads only: a ROM must not drive the bus
+    // while the CPU is writing.
+    if (l_active && bus.rw && 0x8000 <= bus.addr && bus.addr < BUS_ROM_TOP) {
+      rom_offset = (bus.addr ^ 0x4000) & l_mask;
+      bus.data = rom_ptr[rom_offset];
+      pio_put_fifo(PSM_READ, bus.data);
+#if DIAG_RING
+      if (!diag_frozen) {
+        diag_bf[diag_bf_idx & (BF_CAP - 1)] =
+          bus.addr | (bus.rw ? 0x10000 : 0) | ((uint32_t)bus.data << 24);
+        diag_bf_idx++;
+        if (bus.addr < BUS_ROM_BASE)
+          diag_lo_reads++;
+        else
+          diag_hi_reads++;
+      }
+#endif
+      last_bus_state = bus.combined;
+      continue;
+    }
+#endif // COCO_CART_WINDOW
 
     if (!user_rom_base && rom_ptr != ROM)
       rom_ptr = ROM;
@@ -263,12 +323,25 @@ void __time_critical_func(romulan)(void)
         break;
 
       case IO_CONTROL: // Write control reg
+        diag_ioctl++;
         // Command to enable/disable user ROM, or enable/disable ROM autostart
       	if (bus.data & IO_FLAG_ROM_MODE_CMD) {
           // Enable/disable user ROM
           if (bus.data & IO_FLAG_USERROM_ENABLE) {
             user_rom_active = true;
-            rom_ptr = &user_rom[user_rom_selected_bank * ROM_SEG_SIZE];
+            if ((user_rom_type & 0xC0) == 0xC0 || user_rom_type == ROM_TYPE_UNKNOWN) {
+              rom_ptr = &user_rom[0];
+            } else {
+              rom_ptr = &user_rom[user_rom_selected_bank * ROM_SEG_SIZE];
+            }
+            rom_addr_mask = user_rom_mask;
+            l_mask = user_rom_mask;
+            l_active = true;
+            diag_lo_reads = 0;
+            diag_hi_reads = 0;
+            diag_bf_idx = 0;
+            diag_frozen = false;
+            diag_blink_count = user_rom_bank_count > 9 ? 9 : user_rom_bank_count;
             if (bus.data & IO_FLAG_AUTOSTART_ENABLE) {
 #ifdef BOARD_coco_proto_260402
               // Enable auto start (CoCo)
@@ -277,6 +350,7 @@ void __time_critical_func(romulan)(void)
               // routine autostarts the cartridge.
               cart_toggle_active = true;
               cart_toggle_start_ms = to_ms_since_boot(get_absolute_time());
+              diag_resets++;
               gpio_put(RESET_PIN, 0);
               gpio_set_dir(RESET_PIN, GPIO_OUT);   // assert RESET low
               reset_active = true;
@@ -286,12 +360,18 @@ void __time_critical_func(romulan)(void)
           }
           else {
             user_rom_active = false;
+            rom_addr_mask = SIZE_16K - 1;
+            l_active = false;
+            l_mask = SIZE_16K - 1;
             rom_ptr = &ROM[0];
           }
        	}
         else if (bus.data & IO_FLAG_ROM_BANK_CMD) {
           user_rom_selected_bank = bus.data & IO_MASK_ROM_BANK;
-          rom_ptr = &user_rom[user_rom_selected_bank * ROM_SEG_SIZE];
+          // CoCo maps statically in the read handler; MSX selects a bank.
+          if ((user_rom_type & 0xC0) != 0xC0 && user_rom_type != ROM_TYPE_UNKNOWN) {
+            rom_ptr = &user_rom[user_rom_selected_bank * ROM_SEG_SIZE];
+          }
         }
         break;
       }
@@ -339,13 +419,24 @@ void __time_critical_func(romulan)(void)
         bank_offsets[bank] = (bus.data % user_rom_bank_count) * bank_size;
     }
 #endif
-    else if ((BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP)) {
 #ifndef RD_PIN
+#if COCO_CART_WINDOW
+    // CTS covers $C000-$FEFF, and $8000-$FEFF in 32K external ROM mode.
+    else if (0x8000 <= bus.addr && bus.addr < BUS_ROM_TOP) {
+      rom_offset = (bus.addr ^ 0x4000) & rom_addr_mask;
+      bus.data = rom_ptr[rom_offset];
+      pio_put_fifo(PSM_READ, bus.data);
+    }
+#else
+    else if ((BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP)) {
       // No banking hardware: serve directly to keep the response path short
       rom_offset = bus.addr - BUS_ROM_BASE;
       bus.data = rom_ptr[rom_offset];
       pio_put_fifo(PSM_READ, bus.data);
+    }
+#endif // COCO_CART_WINDOW
 #else
+    else if ((BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP)) {
       rom_offset = bus.addr;
 
       if (user_rom_type == ROM_TYPE_MSX_KONAMI) {
@@ -366,8 +457,8 @@ void __time_critical_func(romulan)(void)
 
       bus.data = rom_ptr[rom_offset + bank_offsets[bank] - bank * bank_size];
       pio_put_fifo(PSM_READ, bus.data);
-#endif // RD_PIN
     }
+#endif // RD_PIN
 
     last_bus_state = bus.combined;
   }
@@ -428,7 +519,9 @@ bool process_command(ByteBuffer &buffer)
       user_rom_base = &user_rom[offset];
       user_rom_write_pos = 0;
       user_rom_closed = false;
-      user_rom_type = (fujiROMType_t)packet->param(1);
+      // param() is unchecked; the sender may supply only the offset.
+      user_rom_type = packet->paramCount() > 1
+        ? (fujiROMType_t)packet->param(1) : ROM_TYPE_UNKNOWN;
       bank_size = user_rom_type & 0x80 ? SIZE_16K : SIZE_8K;
       reset_bank_offsets();
       sendReplyPacket(packet->device(), true, nullptr, 0);
@@ -459,10 +552,32 @@ bool process_command(ByteBuffer &buffer)
   case FUJICMD_CLOSE:
     if (user_rom_write_pos < 0 || !user_rom_base)
       sendReplyPacket(packet->device(), false, nullptr, 0);
+
+    if (user_rom_type == ROM_TYPE_UNKNOWN && user_rom_write_pos > 0) {
+      bank_size = SIZE_16K;
+      if (user_rom_write_pos <= 0x8000) {
+        user_rom_type = ROM_TYPE_COCO_32K_FF90;
+      } else if (user_rom_write_pos <= 0x10000) {
+        user_rom_type = ROM_TYPE_COCO_64K_FF90;
+      } else {
+        user_rom_type = ROM_TYPE_COCO_128K_FF90;
+      }
+    } else if ((user_rom_type & 0xC0) == 0xC0) {
+      bank_size = SIZE_16K;
+    }
+
     if (user_rom_write_pos > 0)
       user_rom_bank_count = (user_rom_write_pos + bank_size - 1) / bank_size;
     if (user_rom_bank_count == 0)
       user_rom_bank_count = 1;
+    user_rom_len = user_rom_write_pos > 0 ? user_rom_write_pos : 0;
+    {
+      uint32_t window = user_rom_len ? POW2_CEIL(user_rom_len) : SIZE_16K;
+      if (window > SIZE_32K)
+        window = SIZE_32K;
+      user_rom_mask = window - 1;
+    }
+    rom_addr_mask = user_rom_mask;
     user_rom_write_pos = -1;
     user_rom_closed = true;
 #if VERBOSE_DEBUG
@@ -488,6 +603,53 @@ bool process_command(ByteBuffer &buffer)
   return true;
 }
 
+static void diag_set(bool on)
+{
+#ifdef LED_PIN
+  gpio_put(LED_PIN, on);
+#else
+  (void)on;
+#endif // LED_PIN
+}
+
+// setup_pio_irq_logic() resets every GPIO to an input, so claim the pin here.
+static void diag_open(void)
+{
+  gpio_init(DIAG_PIN);
+  gpio_set_dir(DIAG_PIN, GPIO_OUT);
+  gpio_put(DIAG_PIN, 1);
+  busy_wait_us_32(DIAG_BIT_US * 4);
+}
+
+static void diag_putc(char c)
+{
+  // A status line blocks for ~99ms at 9600, against a 100ms watchdog.
+  watchdog_update();
+  uint32_t save = save_and_disable_interrupts();
+
+  gpio_put(DIAG_PIN, 0);
+  busy_wait_us_32(DIAG_BIT_US);
+  for (int bit = 0; bit < 8; bit++) {
+    gpio_put(DIAG_PIN, (c >> bit) & 1);
+    busy_wait_us_32(DIAG_BIT_US);
+  }
+  gpio_put(DIAG_PIN, 1);
+  restore_interrupts(save);
+  busy_wait_us_32(DIAG_BIT_US);
+}
+
+static void diag_puts(const char *s)
+{
+  while (*s)
+    diag_putc(*s++);
+}
+
+static void diag_hex(uint32_t v, int digits)
+{
+  while (--digits >= 0)
+    diag_putc("0123456789abcdef"[(v >> (digits * 4)) & 0xF]);
+}
+
 int main()
 {
   BusSignals bus;
@@ -502,7 +664,17 @@ int main()
 
   reset_bank_offsets();
 
+#ifdef BOARD_coco_proto_260402
+  // Needed to serve the cart bus at 2MHz. Voltage must come up first and
+  // settle; the clock alone leaves the chip unstable. Non-panicking form so a
+  // failed request cannot hang before USB is up.
+  vreg_set_voltage(VREG_VOLTAGE_1_20);
+  sleep_ms(10);
+  if (!set_sys_clock_khz(300000, false))
+    set_sys_clock_khz(250000, true);
+#else
   set_sys_clock_khz(250000, true);
+#endif
 
 #ifdef LED_PIN
   gpio_init(LED_PIN);
@@ -539,6 +711,85 @@ int main()
 
     if (!serial_ready && now - loop_begin > SERIAL_BEGIN_DELAY)
       serial_ready = true;
+
+    // Deferred until the cartridge is running and DriveWire is idle.
+    {
+      static uint32_t diag_due = 0;
+      static uint32_t diag_bf_snap = 0, diag_bf_base = 0;
+      static uint32_t s_lo, s_hi;
+      static int diag_idx = -1;
+      static bool diag_sent = false, diag_was_active = false;
+
+      if (user_rom_active && !diag_was_active) {
+        diag_due = now + 5000;
+        diag_sent = false;
+      }
+      diag_was_active = user_rom_active;
+
+      if (diag_idx >= 0) {
+        if ((uint32_t)diag_idx >= diag_bf_snap) {
+          diag_puts("\r\n");
+          diag_idx = -1;
+          diag_frozen = false;        // resume recording
+          diag_due = now + 10000;     // and report again
+          diag_sent = false;
+        }
+        else {
+          uint32_t e = diag_bf[(diag_bf_base + diag_idx++) & (BF_CAP - 1)];
+          diag_hex(e & 0xFFFF, 4);
+          diag_putc(e & 0x10000 ? 'r' : 'w');
+          diag_putc(':');
+          diag_hex(e >> 24, 2);
+          diag_putc(' ');
+        }
+      }
+      else if (!diag_sent && !diag_frozen && diag_due
+               && (int32_t)(now - diag_due) >= 0) {
+        diag_sent = true;
+        diag_idx = 0;
+        diag_frozen = true;             // stop core 1 so the buffer stays coherent
+        s_lo = diag_lo_reads; s_hi = diag_hi_reads;
+        if (diag_bf_idx >= BF_CAP) {
+          diag_bf_snap = BF_CAP;
+          diag_bf_base = diag_bf_idx & (BF_CAP - 1);
+        }
+        else {
+          diag_bf_snap = diag_bf_idx;
+          diag_bf_base = 0;
+        }
+        diag_open();
+        diag_puts("FV rs=");
+        diag_hex(diag_resets, 2);
+        diag_puts(" io=");
+        diag_hex(diag_ioctl, 2);
+        diag_puts(" a=");
+        diag_putc(user_rom_active ? '1' : '0');
+        diag_puts(" lo=");
+        diag_hex(s_lo, 6);
+        diag_puts(" hi=");
+        diag_hex(s_hi, 6);
+        diag_puts("\r\n");
+      }
+    }
+
+    if (!diag_blink_count)
+      diag_set(true);
+    else {
+      static uint32_t diag_next = 0;
+      static uint8_t diag_phase = 0xFF;
+      uint8_t flashes = diag_blink_count;
+      uint8_t last_phase = flashes * 2;
+
+      if (diag_phase == 0xFF || (int32_t)(now - diag_next) >= 0) {
+        if (diag_phase == 0xFF || diag_phase >= last_phase)
+          diag_phase = 0;
+        else
+          diag_phase++;
+        bool on = diag_phase < last_phase && !(diag_phase & 1);
+        diag_set(on);
+        diag_next = now + (diag_phase < last_phase ? 250 : 2000);
+      }
+    }
 
 #ifdef BOARD_coco_proto_260402
     // Release RESET once the pulse has elapsed (open-drain: back to input) so
