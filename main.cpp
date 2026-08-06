@@ -54,14 +54,6 @@
 #define SIZE_16K  0x4000
 #define SIZE_32K  0x8000
 
-// CoCo maps image $0000-$3FFF to $C000-$FFFF and $4000-$7FFF to $8000-$BFFF,
-// i.e. the index is the address with A14 inverted. Others map from BUS_ROM_BASE.
-#if defined(BOARD_coco_proto_260402) || defined(BOARD_picorom_coco)
-#define COCO_CART_WINDOW 1
-#else
-#define COCO_CART_WINDOW 0
-#endif
-
 #define USE_IRQ 0
 
 #define PSM_WAITSEL 0
@@ -105,13 +97,17 @@ volatile bool user_rom_closed = false;
 volatile bool user_rom_active = false;
 volatile uint16_t rom_addr_mask = SIZE_16K - 1;
 
-// Diagnostic readout on GP37, 9600 8N1 bit-banged from core 0 only. Transmit
-// blocks, so it must not run while DriveWire is active.
+volatile uint32_t user_rom_len = 0;
+
+// Diagnostic log on GP37, 9600 8N1 bit-banged from core 0. Transmit blocks, so
+// it only runs once the cartridge is up and DriveWire is idle. Nothing here is
+// built unless RP2350_LOGGING is defined - the read path has no slack for it.
+//#define RP2350_LOGGING
+#ifdef RP2350_LOGGING
 #define DIAG_PIN 37
 #define DIAG_BIT_US 104
-#define DIAG_RING 1
-volatile uint8_t diag_blink_count = 0;
-volatile uint32_t user_rom_len = 0;
+// Per-cycle recording. Costs a store and two counters on every served read.
+#define DIAG_RING 0
 volatile uint32_t diag_lo_reads = 0;
 volatile uint32_t diag_hi_reads = 0;
 // Stops core 1 recording mid-dump, so the ring is a sequence and not samples.
@@ -122,8 +118,17 @@ volatile uint16_t diag_ioctl = 0;
 #define BF_CAP 128
 volatile uint32_t diag_bf[BF_CAP];
 volatile uint32_t diag_bf_idx = 0;
+// Bumped per user-ROM enable so successive carts in one capture are told apart.
+volatile uint8_t diag_mount = 0;
+#endif // RP2350_LOGGING
+// Served cart reads. A BASIC signature probe reads a handful; real execution
+// reads thousands, which is how we know the autostart has done its job.
+volatile uint32_t served_reads = 0;
 // Rounded up to a power of two so short carts mirror, as real hardware does.
 volatile uint16_t user_rom_mask = SIZE_16K - 1;
+// CoCo images larger than 32K present a 16K window whose bank number is written
+// to an even address in the SCS range.
+volatile bool user_rom_banked = false;
 
 #ifdef BOARD_coco_proto_260402
 // Power-on-like Program Pak boot: on user-ROM enable we point rom_ptr at the
@@ -252,6 +257,9 @@ void __time_critical_func(romulan)(void)
   // Register-resident mirrors so the fast path never reloads the volatiles.
   bool l_active = false;
   uint16_t l_mask = SIZE_16K - 1;
+  bool l_banked = false;
+  uint32_t l_bank_off = 0;
+  uint16_t l_xor = 0x4000;
   uint32_t last_bus_state = -1;
   uint8_t bank = 0;
   bool switch_bank = false;
@@ -274,13 +282,14 @@ void __time_critical_func(romulan)(void)
                  bus.addr, bus.data, 0, bus.scs, bus.rw, bus.unused, bus.combined);
 #endif
 
-#if COCO_CART_WINDOW
+#if defined(BOARD_coco_proto_260402) || defined(BOARD_picorom_coco)
     // Answer first, record after. Reads only: a ROM must not drive the bus
     // while the CPU is writing.
     if (l_active && bus.rw && 0x8000 <= bus.addr && bus.addr < BUS_ROM_TOP) {
-      rom_offset = (bus.addr ^ 0x4000) & l_mask;
+      rom_offset = l_bank_off + ((bus.addr ^ l_xor) & l_mask);
       bus.data = rom_ptr[rom_offset];
       pio_put_fifo(PSM_READ, bus.data);
+      served_reads++;
 #if DIAG_RING
       if (!diag_frozen) {
         diag_bf[diag_bf_idx & (BF_CAP - 1)] =
@@ -295,7 +304,20 @@ void __time_critical_func(romulan)(void)
       last_bus_state = bus.combined;
       continue;
     }
-#endif // COCO_CART_WINDOW
+
+    // GMC bank select: a write to an even address in the SCS window, excluding
+    // our own IO registers.
+    // $FF40 is also the RS-DOS disk controller register, so ignore writes until
+    // the cartridge is demonstrably running and HDB-DOS is out of the picture.
+    if (l_banked && served_reads > 256
+        && !bus.rw && 0xFF40 <= bus.addr && bus.addr < 0xFF60
+        && !(bus.addr & 1) && (bus.addr < IO_BASE || bus.addr >= IO_TOP)) {
+      l_bank_off = (bus.data % user_rom_bank_count) * SIZE_16K;
+      bank_offsets[0] = l_bank_off;
+      last_bus_state = bus.combined;
+      continue;
+    }
+#endif
 
     if (!user_rom_base && rom_ptr != ROM)
       rom_ptr = ROM;
@@ -323,7 +345,9 @@ void __time_critical_func(romulan)(void)
         break;
 
       case IO_CONTROL: // Write control reg
+#ifdef RP2350_LOGGING
         diag_ioctl++;
+#endif
         // Command to enable/disable user ROM, or enable/disable ROM autostart
       	if (bus.data & IO_FLAG_ROM_MODE_CMD) {
           // Enable/disable user ROM
@@ -336,12 +360,20 @@ void __time_critical_func(romulan)(void)
             }
             rom_addr_mask = user_rom_mask;
             l_mask = user_rom_mask;
+            l_banked = user_rom_banked;
+            l_bank_off = 0;
+            l_xor = user_rom_banked ? 0 : 0x4000;
+            if (user_rom_banked)
+              l_mask = SIZE_16K - 1;
             l_active = true;
+            served_reads = 0;
+#ifdef RP2350_LOGGING
             diag_lo_reads = 0;
             diag_hi_reads = 0;
             diag_bf_idx = 0;
+            diag_mount++;
             diag_frozen = false;
-            diag_blink_count = user_rom_bank_count > 9 ? 9 : user_rom_bank_count;
+#endif
             if (bus.data & IO_FLAG_AUTOSTART_ENABLE) {
 #ifdef BOARD_coco_proto_260402
               // Enable auto start (CoCo)
@@ -350,7 +382,9 @@ void __time_critical_func(romulan)(void)
               // routine autostarts the cartridge.
               cart_toggle_active = true;
               cart_toggle_start_ms = to_ms_since_boot(get_absolute_time());
+#ifdef RP2350_LOGGING
               diag_resets++;
+#endif
               gpio_put(RESET_PIN, 0);
               gpio_set_dir(RESET_PIN, GPIO_OUT);   // assert RESET low
               reset_active = true;
@@ -420,7 +454,7 @@ void __time_critical_func(romulan)(void)
     }
 #endif
 #ifndef RD_PIN
-#if COCO_CART_WINDOW
+#if defined(BOARD_coco_proto_260402) || defined(BOARD_picorom_coco)
     // CTS covers $C000-$FEFF, and $8000-$FEFF in 32K external ROM mode.
     else if (0x8000 <= bus.addr && bus.addr < BUS_ROM_TOP) {
       rom_offset = (bus.addr ^ 0x4000) & rom_addr_mask;
@@ -434,7 +468,7 @@ void __time_critical_func(romulan)(void)
       bus.data = rom_ptr[rom_offset];
       pio_put_fifo(PSM_READ, bus.data);
     }
-#endif // COCO_CART_WINDOW
+#endif
 #else
     else if ((BUS_ROM_BASE <= bus.addr && bus.addr < BUS_ROM_TOP)) {
       rom_offset = bus.addr;
@@ -553,6 +587,9 @@ bool process_command(ByteBuffer &buffer)
     if (user_rom_write_pos < 0 || !user_rom_base)
       sendReplyPacket(packet->device(), false, nullptr, 0);
 
+    // The host sends no ROM type, so classify by size. CoCo only: an MSX build
+    // must not have its cartridges labelled CoCo and forced to 16K banks.
+#if defined(BOARD_coco_proto_260402) || defined(BOARD_picorom_coco)
     if (user_rom_type == ROM_TYPE_UNKNOWN && user_rom_write_pos > 0) {
       bank_size = SIZE_16K;
       if (user_rom_write_pos <= 0x8000) {
@@ -562,7 +599,9 @@ bool process_command(ByteBuffer &buffer)
       } else {
         user_rom_type = ROM_TYPE_COCO_128K_FF90;
       }
-    } else if ((user_rom_type & 0xC0) == 0xC0) {
+    } else
+#endif
+    if ((user_rom_type & 0xC0) == 0xC0) {
       bank_size = SIZE_16K;
     }
 
@@ -577,6 +616,8 @@ bool process_command(ByteBuffer &buffer)
         window = SIZE_32K;
       user_rom_mask = window - 1;
     }
+    user_rom_banked = (user_rom_type == ROM_TYPE_COCO_64K_FF90
+                    || user_rom_type == ROM_TYPE_COCO_128K_FF90);
     rom_addr_mask = user_rom_mask;
     user_rom_write_pos = -1;
     user_rom_closed = true;
@@ -603,16 +644,8 @@ bool process_command(ByteBuffer &buffer)
   return true;
 }
 
-static void diag_set(bool on)
-{
-#ifdef LED_PIN
-  gpio_put(LED_PIN, on);
-#else
-  (void)on;
-#endif // LED_PIN
-}
-
 // setup_pio_irq_logic() resets every GPIO to an input, so claim the pin here.
+#ifdef RP2350_LOGGING
 static void diag_open(void)
 {
   gpio_init(DIAG_PIN);
@@ -649,6 +682,7 @@ static void diag_hex(uint32_t v, int digits)
   while (--digits >= 0)
     diag_putc("0123456789abcdef"[(v >> (digits * 4)) & 0xF]);
 }
+#endif // RP2350_LOGGING
 
 int main()
 {
@@ -712,6 +746,7 @@ int main()
     if (!serial_ready && now - loop_begin > SERIAL_BEGIN_DELAY)
       serial_ready = true;
 
+#ifdef RP2350_LOGGING
     // Deferred until the cartridge is running and DriveWire is idle.
     {
       static uint32_t diag_due = 0;
@@ -758,12 +793,22 @@ int main()
           diag_bf_base = 0;
         }
         diag_open();
-        diag_puts("FV rs=");
+        diag_puts("FV m=");
+        diag_hex(diag_mount, 2);
+        diag_puts(" rs=");
         diag_hex(diag_resets, 2);
         diag_puts(" io=");
         diag_hex(diag_ioctl, 2);
         diag_puts(" a=");
         diag_putc(user_rom_active ? '1' : '0');
+        diag_puts(" len=");
+        diag_hex(user_rom_len, 5);
+        diag_puts(" msk=");
+        diag_hex(user_rom_mask, 4);
+        diag_puts(" bk=");
+        diag_hex(user_rom_bank_count, 2);
+        diag_puts(" ty=");
+        diag_hex(user_rom_type, 2);
         diag_puts(" lo=");
         diag_hex(s_lo, 6);
         diag_puts(" hi=");
@@ -771,25 +816,9 @@ int main()
         diag_puts("\r\n");
       }
     }
+#endif // RP2350_LOGGING
 
-    if (!diag_blink_count)
-      diag_set(true);
-    else {
-      static uint32_t diag_next = 0;
-      static uint8_t diag_phase = 0xFF;
-      uint8_t flashes = diag_blink_count;
-      uint8_t last_phase = flashes * 2;
 
-      if (diag_phase == 0xFF || (int32_t)(now - diag_next) >= 0) {
-        if (diag_phase == 0xFF || diag_phase >= last_phase)
-          diag_phase = 0;
-        else
-          diag_phase++;
-        bool on = diag_phase < last_phase && !(diag_phase & 1);
-        diag_set(on);
-        diag_next = now + (diag_phase < last_phase ? 250 : 2000);
-      }
-    }
 
 #ifdef BOARD_coco_proto_260402
     // Release RESET once the pulse has elapsed (open-drain: back to input) so
@@ -805,7 +834,7 @@ int main()
     // FIRQs don't disrupt a later CFGLOAD/CONFIG.BIN boot. Unsigned delta is
     // wraparound-safe.
     if (cart_toggle_active) {
-      if (now - cart_toggle_start_ms >= CART_TOGGLE_MS) {
+      if (served_reads > 256 || now - cart_toggle_start_ms >= CART_TOGGLE_MS) {
         cart_toggle_active = false;
         gpio_put(CART_PIN, 1);
       }
