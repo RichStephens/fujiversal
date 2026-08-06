@@ -4,6 +4,7 @@
 #include "fujiDeviceID.h"
 #include "fujiCommandID.h"
 #include "fujiROMType.h"
+#include "diag_uart.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -99,28 +100,6 @@ volatile uint16_t rom_addr_mask = SIZE_16K - 1;
 
 volatile uint32_t user_rom_len = 0;
 
-// Diagnostic log on GP37, 9600 8N1 bit-banged from core 0. Transmit blocks, so
-// it only runs once the cartridge is up and DriveWire is idle. Nothing here is
-// built unless RP2350_LOGGING is defined - the read path has no slack for it.
-//#define RP2350_LOGGING
-#ifdef RP2350_LOGGING
-#define DIAG_PIN 37
-#define DIAG_BIT_US 104
-// Per-cycle recording. Costs a store and two counters on every served read.
-#define DIAG_RING 0
-volatile uint32_t diag_lo_reads = 0;
-volatile uint32_t diag_hi_reads = 0;
-// Stops core 1 recording mid-dump, so the ring is a sequence and not samples.
-volatile bool diag_frozen = false;
-volatile uint16_t diag_resets = 0;
-volatile uint16_t diag_ioctl = 0;
-// addr | rw<<16 | data<<24
-#define BF_CAP 128
-volatile uint32_t diag_bf[BF_CAP];
-volatile uint32_t diag_bf_idx = 0;
-// Bumped per user-ROM enable so successive carts in one capture are told apart.
-volatile uint8_t diag_mount = 0;
-#endif // RP2350_LOGGING
 // Served cart reads. A BASIC signature probe reads a handful; real execution
 // reads thousands, which is how we know the autostart has done its job.
 volatile uint32_t served_reads = 0;
@@ -247,8 +226,6 @@ void setup_pio_irq_logic()
   return;
 }
 
-// Bookkeeping only - never call this before the bus has been answered.
-
 void __time_critical_func(romulan)(void)
 {
   BusSignals bus;
@@ -290,17 +267,7 @@ void __time_critical_func(romulan)(void)
       bus.data = rom_ptr[rom_offset];
       pio_put_fifo(PSM_READ, bus.data);
       served_reads++;
-#if DIAG_RING
-      if (!diag_frozen) {
-        diag_bf[diag_bf_idx & (BF_CAP - 1)] =
-          bus.addr | (bus.rw ? 0x10000 : 0) | ((uint32_t)bus.data << 24);
-        diag_bf_idx++;
-        if (bus.addr < BUS_ROM_BASE)
-          diag_lo_reads++;
-        else
-          diag_hi_reads++;
-      }
-#endif
+      diag_record(bus.addr, bus.rw, bus.data, bus.addr < BUS_ROM_BASE);
       last_bus_state = bus.combined;
       continue;
     }
@@ -345,9 +312,7 @@ void __time_critical_func(romulan)(void)
         break;
 
       case IO_CONTROL: // Write control reg
-#ifdef RP2350_LOGGING
-        diag_ioctl++;
-#endif
+        diag_count_ioctl();
         // Command to enable/disable user ROM, or enable/disable ROM autostart
       	if (bus.data & IO_FLAG_ROM_MODE_CMD) {
           // Enable/disable user ROM
@@ -367,13 +332,7 @@ void __time_critical_func(romulan)(void)
               l_mask = SIZE_16K - 1;
             l_active = true;
             served_reads = 0;
-#ifdef RP2350_LOGGING
-            diag_lo_reads = 0;
-            diag_hi_reads = 0;
-            diag_bf_idx = 0;
-            diag_mount++;
-            diag_frozen = false;
-#endif
+            diag_mount_begin();
             if (bus.data & IO_FLAG_AUTOSTART_ENABLE) {
 #ifdef BOARD_coco_proto_260402
               // Enable auto start (CoCo)
@@ -382,9 +341,7 @@ void __time_critical_func(romulan)(void)
               // routine autostarts the cartridge.
               cart_toggle_active = true;
               cart_toggle_start_ms = to_ms_since_boot(get_absolute_time());
-#ifdef RP2350_LOGGING
-              diag_resets++;
-#endif
+              diag_count_reset();
               gpio_put(RESET_PIN, 0);
               gpio_set_dir(RESET_PIN, GPIO_OUT);   // assert RESET low
               reset_active = true;
@@ -645,44 +602,6 @@ bool process_command(ByteBuffer &buffer)
 }
 
 // setup_pio_irq_logic() resets every GPIO to an input, so claim the pin here.
-#ifdef RP2350_LOGGING
-static void diag_open(void)
-{
-  gpio_init(DIAG_PIN);
-  gpio_set_dir(DIAG_PIN, GPIO_OUT);
-  gpio_put(DIAG_PIN, 1);
-  busy_wait_us_32(DIAG_BIT_US * 4);
-}
-
-static void diag_putc(char c)
-{
-  // A status line blocks for ~99ms at 9600, against a 100ms watchdog.
-  watchdog_update();
-  uint32_t save = save_and_disable_interrupts();
-
-  gpio_put(DIAG_PIN, 0);
-  busy_wait_us_32(DIAG_BIT_US);
-  for (int bit = 0; bit < 8; bit++) {
-    gpio_put(DIAG_PIN, (c >> bit) & 1);
-    busy_wait_us_32(DIAG_BIT_US);
-  }
-  gpio_put(DIAG_PIN, 1);
-  restore_interrupts(save);
-  busy_wait_us_32(DIAG_BIT_US);
-}
-
-static void diag_puts(const char *s)
-{
-  while (*s)
-    diag_putc(*s++);
-}
-
-static void diag_hex(uint32_t v, int digits)
-{
-  while (--digits >= 0)
-    diag_putc("0123456789abcdef"[(v >> (digits * 4)) & 0xF]);
-}
-#endif // RP2350_LOGGING
 
 int main()
 {
@@ -746,77 +665,9 @@ int main()
     if (!serial_ready && now - loop_begin > SERIAL_BEGIN_DELAY)
       serial_ready = true;
 
-#ifdef RP2350_LOGGING
     // Deferred until the cartridge is running and DriveWire is idle.
-    {
-      static uint32_t diag_due = 0;
-      static uint32_t diag_bf_snap = 0, diag_bf_base = 0;
-      static uint32_t s_lo, s_hi;
-      static int diag_idx = -1;
-      static bool diag_sent = false, diag_was_active = false;
-
-      if (user_rom_active && !diag_was_active) {
-        diag_due = now + 5000;
-        diag_sent = false;
-      }
-      diag_was_active = user_rom_active;
-
-      if (diag_idx >= 0) {
-        if ((uint32_t)diag_idx >= diag_bf_snap) {
-          diag_puts("\r\n");
-          diag_idx = -1;
-          diag_frozen = false;        // resume recording
-          diag_due = now + 10000;     // and report again
-          diag_sent = false;
-        }
-        else {
-          uint32_t e = diag_bf[(diag_bf_base + diag_idx++) & (BF_CAP - 1)];
-          diag_hex(e & 0xFFFF, 4);
-          diag_putc(e & 0x10000 ? 'r' : 'w');
-          diag_putc(':');
-          diag_hex(e >> 24, 2);
-          diag_putc(' ');
-        }
-      }
-      else if (!diag_sent && !diag_frozen && diag_due
-               && (int32_t)(now - diag_due) >= 0) {
-        diag_sent = true;
-        diag_idx = 0;
-        diag_frozen = true;             // stop core 1 so the buffer stays coherent
-        s_lo = diag_lo_reads; s_hi = diag_hi_reads;
-        if (diag_bf_idx >= BF_CAP) {
-          diag_bf_snap = BF_CAP;
-          diag_bf_base = diag_bf_idx & (BF_CAP - 1);
-        }
-        else {
-          diag_bf_snap = diag_bf_idx;
-          diag_bf_base = 0;
-        }
-        diag_open();
-        diag_puts("FV m=");
-        diag_hex(diag_mount, 2);
-        diag_puts(" rs=");
-        diag_hex(diag_resets, 2);
-        diag_puts(" io=");
-        diag_hex(diag_ioctl, 2);
-        diag_puts(" a=");
-        diag_putc(user_rom_active ? '1' : '0');
-        diag_puts(" len=");
-        diag_hex(user_rom_len, 5);
-        diag_puts(" msk=");
-        diag_hex(user_rom_mask, 4);
-        diag_puts(" bk=");
-        diag_hex(user_rom_bank_count, 2);
-        diag_puts(" ty=");
-        diag_hex(user_rom_type, 2);
-        diag_puts(" lo=");
-        diag_hex(s_lo, 6);
-        diag_puts(" hi=");
-        diag_hex(s_hi, 6);
-        diag_puts("\r\n");
-      }
-    }
-#endif // RP2350_LOGGING
+    diag_poll(now, user_rom_active, user_rom_len, user_rom_mask,
+              user_rom_bank_count, user_rom_type);
 
 
 
