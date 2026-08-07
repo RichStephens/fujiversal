@@ -263,6 +263,10 @@ void __time_critical_func(romulan)(void)
     // Answer first, record after. Reads only: a ROM must not drive the bus
     // while the CPU is writing.
     if (l_active && bus.rw && 0x8000 <= bus.addr && bus.addr < BUS_ROM_TOP) {
+      // The cart sees A14 inverted: image $0000-$3FFF is CPU $C000-$FFFF and
+      // $4000-$7FFF is $8000-$BFFF. Looks reversed but is not - a game's 16K
+      // image matches the first half of its 32K image, and a 16K cart lives at
+      // $C000. Banked carts use a 16K window instead, where l_xor is 0.
       rom_offset = l_bank_off + ((bus.addr ^ l_xor) & l_mask);
       bus.data = rom_ptr[rom_offset];
       pio_put_fifo(PSM_READ, bus.data);
