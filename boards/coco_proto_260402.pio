@@ -123,11 +123,6 @@ void send_bus_init_setup(sm_setup_t *setup)
 %}
 
 .program read
-; Drive D0-D7 only while the cartridge is selected. "Selected" is
-; (/CTS low || /SCS low): /CTS covers the ROM window $C000-$FEFF, /SCS covers
-; the IO registers at $FF40-$FF5F. SCS_PIN, IGNORE_PIN and CTS_PIN are
-; consecutive, and IGNORE_PIN is pulled up, so it reads as 0 once inverted and
-; does not disturb the test -- same trick wait_sel uses.
 .define NUM_SEL 3               ; CTS_PIN - SCS_PIN + 1
 
 	mov y, null                    ; y = 0, the "deselected" comparator
@@ -152,10 +147,7 @@ wait_deselected:
 .wrap
 
 % c-sdk {
-// Init the data pins as input so they start in Hi-Z state. The select pins are
-// listed so this SM lands in a GPIO window that can reach CTS_PIN -- the
-// program no longer names it in a "wait gpio", so used_gpio_ranges no longer
-// covers it.
+// Init the data pins as input so they start in Hi-Z state.
 static const pin_range_t read_pins[] = {
   { D0_PIN, DATA_WIDTH, GPIO_IN },
   { SCS_PIN, 3, GPIO_IN         },  // /SCS, IGNORE, /CTS
